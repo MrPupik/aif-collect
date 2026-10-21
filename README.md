@@ -2,7 +2,7 @@
 
 Bundles your Claude Code sessions into one zip
 
-- **Local only.** nothing is sent automaticlly. You send the zip yourself.
+- **Local only.** Nothing is sent automaticlly. You send the zip yourself.
 - **Read only.** Your original files are never modified.
 
 ## Run it
