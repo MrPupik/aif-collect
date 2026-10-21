@@ -1,14 +1,13 @@
 # AI-fluent collect
 
-Bundles your Claude Code sessions into one zip, so they can be studied. You pick the projects, secrets and your name are redacted, and you review everything before the zip is created.
+Bundles your Claude Code sessions into one zip
 
 - **Local only.** No network calls, nothing is uploaded. You send the zip yourself.
 - **Read only.** Your original files are never modified.
-- Single file, Python 3.8+, no dependencies.
 
 ## Run it
 
-You need Python 3.8 or newer. Download the file, then run it (the two steps are separate because the tool asks you questions, so it can't be piped straight into Python).
+You need Python 3.8 or newer. 
 
 ### macOS / Linux (Terminal)
 
@@ -31,12 +30,12 @@ Notes:
 
 ## What happens
 
-1. Pick projects: Up/Down to move, Space to select, `a` for all/none, Enter to confirm, `q` to quit. (If your terminal can't do this, you type numbers like `1,3,5-7` or `all` instead.)
-2. Optionally enter names to anonymize, then an alias, outcome and one-line reason per project, and any extra files to include.
-3. A review screen shows what will be included, what was redacted and what was skipped. Type `y` to continue, or `o` to open the staging folder and look first.
+1. Pick projects
+2. Optionally enter names to anonymize
+3. A review screen shows what will be included,
 4. You get `aif-export-YYYYMMDD-HHMM.zip` on your Desktop (or home folder). Send it yourself.
 
-Secrets become `[REDACTED]`, your home path and username become `<USER>`. `.env`, key files, `node_modules` and files over 5 MB are left out. Git history is included unless it is over 15 MB, and is dropped if it contains a secret.
+If you use step (2). Secrets become `[REDACTED]`, your home path and username become `<USER>`. `.env`, key files, `node_modules` and files over 5 MB are left out. 
 
 ## Options
 
