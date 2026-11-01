@@ -219,6 +219,16 @@ def scan_head(path):
     return found["cwd"], found["sessionId"], found["version"]
 
 
+def project_name(cwd, fallback):
+    if not cwd:
+        return fallback
+    parts = Path(cwd.replace("\\", "/")).parts
+    for i in range(len(parts) - 3, 0, -1):
+        if parts[i:i + 2] == (".claude", "worktrees") and i + 2 < len(parts):
+            return "%s (worktree %s)" % (parts[i - 1], parts[i + 2])
+    return parts[-1] if parts else fallback
+
+
 def discover_projects(claude_dir, since=None):
     projects, warnings = [], []
     for d in sorted((claude_dir / "projects").iterdir()):
@@ -254,7 +264,7 @@ def discover_projects(claude_dir, since=None):
         projects.append({
             "dir": d,
             "cwd": cwd,
-            "name": Path(cwd.replace("\\", "/")).name if cwd else d.name,
+            "name": project_name(cwd, d.name),
             "files": [f for f, _, _ in files],
             "sessions": len(top),
             "sids": sorted(sids),
@@ -288,12 +298,12 @@ class KeyboardUnavailable(Exception):
     """Raw key input could not be set up; the caller falls back to the typed menu."""
 
 
-HEADER_ROW = "%3s  %-30s %8s  %-10s %9s" % ("#", "Project", "Sessions", "Last used", "Size")
+HEADER_ROW = "%3s  %-46s %8s  %-10s %9s" % ("#", "Project", "Sessions", "Last used", "Size")
 
 
 def project_row(i, p):
-    return "%3d  %-30s %8d  %-10s %9s" % (
-        i, p["name"][:30], p["sessions"], datetime.date.fromtimestamp(p["last"]).isoformat(), human(p["size"]))
+    return "%3d  %-46s %8d  %-10s %9s" % (
+        i, p["name"][:46], p["sessions"], datetime.date.fromtimestamp(p["last"]).isoformat(), human(p["size"]))
 
 
 def arrows_available():
