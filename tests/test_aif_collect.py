@@ -278,5 +278,95 @@ class EndToEnd(Fixture):
         self.assertIn("interactive", out)
 
 
+class CodexTests(Fixture):
+    def write_codex(self, cwd, name="rollout-2026-11-07T10-00-00-aaa.jsonl", thread_source="user"):
+        d = self.home / ".codex" / "sessions" / "2026" / "11" / "07"
+        d.mkdir(parents=True, exist_ok=True)
+        item = lambda t, **kw: {"timestamp": "t", "type": "event_msg",
+                                "payload": {"type": "item_completed", "item": dict(type=t, **kw)}}
+        recs = [
+            {"timestamp": "t", "type": "session_meta", "payload": {
+                "id": "c1", "cwd": str(cwd), "cli_version": "0.166.0", "thread_source": thread_source,
+                "model_provider": "openai", "creator_account_id": "ACCOUNT-SECRET-ID",
+                "base_instructions": {"text": "SYSTEM PROMPT TEXT"}}},
+            item("UserMessage", id="u", content=[{"type": "text", "text": "key %s by %s" % (FAKE_KEY, FAKE_USER)}]),
+            item("CommandExecution", id="x", command="ls %s/work" % self.home, cwd=str(cwd), status="ok",
+                 exit_code=0, aggregated_output="OUTPUT-SHOULD-DROP"),
+            item("Reasoning", id="r", summary=["REASONING-SHOULD-DROP"]),
+            item("FileChange", id="f", status="ok", changes={"a.py": {"type": "add", "diff": "DIFF-SHOULD-DROP"}}),
+            {"timestamp": "t", "type": "response_item", "payload": {"type": "message", "content": "RAW-DROP"}},
+        ]
+        f = d / name
+        f.write_text("\n".join(json.dumps(r) for r in recs) + "\nnot json\n")
+        return f
+
+    def test_discover_merges_same_folder_and_skips_subagents(self):
+        self.write_codex(self.proj)
+        self.write_codex(self.proj, "rollout-2026-11-07T11-00-00-bbb.jsonl", thread_source="subagent")
+        other = self.home / "work" / "other"
+        other.mkdir()
+        self.write_codex(other, "rollout-2026-11-07T12-00-00-ccc.jsonl")
+        with mock.patch("pathlib.Path.home", return_value=self.home), mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("CODEX_HOME", None)
+            projects, _, _ = aif.discover_all(str(self.claude))
+        by_name = {p["name"]: p for p in projects}
+        self.assertEqual(by_name["exercise"]["tool"], "Both")
+        self.assertEqual(by_name["exercise"]["sessions"], 3)  # 2 claude + 1 codex (subagent thread skipped)
+        self.assertEqual(by_name["other"]["tool"], "Codex")
+
+    def test_codex_only_works_without_claude_dir(self):
+        import shutil
+        shutil.rmtree(str(self.claude))
+        self.write_codex(self.proj)
+        out = io.StringIO()
+        with mock.patch("pathlib.Path.home", return_value=self.home), \
+                mock.patch.dict(os.environ, {}, clear=True), \
+                mock.patch("getpass.getuser", return_value=FAKE_USER), \
+                mock.patch("builtins.input", side_effect=list(self.FULL)), \
+                mock.patch.object(aif, "open_folder"), contextlib.redirect_stdout(out):
+            self.assertEqual(aif.main([]), 0, out.getvalue())
+        with zipfile.ZipFile(str(self.zips()[0])) as zf:
+            self.assertIn("projects/candidate-1/transcripts-codex/rollout-2026-11-07T10-00-00-aaa.jsonl", zf.namelist())
+
+    def test_neither_tool_found_lists_both(self):
+        with mock.patch("pathlib.Path.home", return_value=self.tmp / "nowhere"), \
+                mock.patch.dict(os.environ, {}, clear=True):
+            with self.assertRaises(aif.UserError) as cm:
+                aif.discover_all()
+        self.assertIn(".claude", str(cm.exception))
+        self.assertIn(".codex", str(cm.exception))
+
+    def test_codex_zip_is_pruned_and_clean(self):
+        (self.proj / "AGENTS.md").write_text("agents\n")
+        self.write_codex(self.proj)
+        before = hash_tree(self.home / ".codex")
+        code, out = self.run_main([], self.FULL)
+        self.assertEqual(code, 0, out)
+        self.assertEqual(hash_tree(self.home / ".codex"), before)
+        with zipfile.ZipFile(str(self.zips()[0])) as zf:
+            names = zf.namelist()
+            self.assertIn("projects/candidate-1/transcripts/s1.jsonl", names)  # Claude layout unchanged
+            self.assertIn("projects/candidate-1/instructions/AGENTS.md", names)
+            self.assertIn("projects/candidate-1/instructions/CLAUDE.md", names)
+            text = zf.read("projects/candidate-1/transcripts-codex/rollout-2026-11-07T10-00-00-aaa.jsonl").decode()
+            for bad in (FAKE_KEY, FAKE_USER, str(self.home), "ACCOUNT-SECRET-ID", "SYSTEM PROMPT", "OUTPUT-SHOULD-DROP",
+                        "REASONING-SHOULD-DROP", "DIFF-SHOULD-DROP", "RAW-DROP"):
+                self.assertNotIn(bad, text)
+            recs = [json.loads(l) for l in text.splitlines()]
+            self.assertEqual([r["type"] for r in recs], ["session_meta", "event_msg", "event_msg", "event_msg"])
+            self.assertIn("[REDACTED]", text)
+            self.assertEqual(recs[3]["payload"]["item"]["changes"], {"a.py": {"type": "add"}})
+            manifest = json.loads(zf.read("manifest.json"))
+            self.assertEqual(manifest["projects"][0]["tools"], ["claude-code", "codex"])
+            self.assertEqual(manifest["codex_versions"], ["0.166.0"])
+        self.assertIn("unreadable line", out)
+
+    def test_since_applies_to_codex(self):
+        import datetime
+        self.write_codex(self.proj)
+        sources, _ = aif.discover_codex(self.home / ".codex", datetime.datetime(2999, 1, 1))
+        self.assertEqual(sources, [])
+
+
 if __name__ == "__main__":
     unittest.main()

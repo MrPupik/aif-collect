@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""aif_collect: bundle Claude Code sessions into one redacted, anonymized zip.
+"""aif_collect: bundle Claude Code and Codex sessions into one redacted, anonymized zip.
 
 Local only: no network calls. Originals are only ever read. Python 3.8+, stdlib only.
 """
@@ -42,6 +42,23 @@ SECRET_PATTERNS = [
     re.compile(r"\bBearer\s+[A-Za-z0-9._~+/=\-]{16,}", re.I),
 ]
 
+# What the Codex copy keeps, field by field. Anything not named here (and every record or item type not named) is
+# dropped: command output, file contents, diffs, account ids, the tool's own instructions, reasoning.
+CODEX_SESSION_META = ("id", "timestamp", "cwd", "cli_version", "thread_source", "model", "model_provider")
+CODEX_ITEMS = {
+    "UserMessage": ("id", "content"),
+    "AgentMessage": ("id", "content", "phase"),
+    "CommandExecution": ("id", "command", "cwd", "source", "status", "exit_code"),
+    "McpToolCall": ("id", "server", "tool", "arguments", "status"),
+    "Extension": ("id", "kind", "query", "action"),
+    "FileChange": ("id", "status", "changes"),
+    "ImageView": ("id", "path"),
+}
+CLAUDE = "claude-code"
+CODEX = "codex"
+TOOL_LABELS = {CLAUDE: "Claude Code", CODEX: "Codex"}
+CODEX_TRANSCRIPTS = "transcripts-codex"
+
 
 BANNER = r"""
    _=/    |\_/|    \=_
@@ -54,8 +71,8 @@ BANNER = r"""
 
   AI-fluent collect
   -----------------
-  Made by AI-fluent. Collects your Claude Code
-  sessions into one zip, on your machine only.
+  Made by AI-fluent. Collects your Claude Code and
+  Codex sessions into one zip, on your machine only.
 """
 
 
@@ -127,6 +144,37 @@ def walk_files(root):
         dirnames[:] = sorted(d for d in dirnames if d not in EXCLUDED_DIRS)
         for f in sorted(filenames):
             yield Path(dirpath) / f
+
+
+def _pick(d, keys):
+    return {k: d[k] for k in keys if isinstance(d, dict) and k in d}
+
+
+def prune_codex(rec):
+    """One Codex record -> the record that is kept (same shape, fewer fields), or None."""
+    if not isinstance(rec, dict) or not isinstance(rec.get("payload"), dict):
+        return None
+    p = rec["payload"]
+    out = _pick(rec, ("timestamp", "ordinal", "type"))
+    if rec.get("type") == "session_meta":
+        out["payload"] = _pick(p, CODEX_SESSION_META)
+    elif rec.get("type") == "event_msg" and p.get("type") == "thread_settings_applied":
+        out["payload"] = {"type": p["type"],
+                          "thread_settings": _pick(p.get("thread_settings"), ("model", "model_provider_id"))}
+    elif rec.get("type") == "event_msg" and p.get("type") == "item_completed" and isinstance(p.get("item"), dict) \
+            and p["item"].get("type") in CODEX_ITEMS:
+        item = _pick(p["item"], ("type",) + CODEX_ITEMS[p["item"]["type"]])
+        if isinstance(item.get("content"), list):
+            item["content"] = [_pick(c, ("type", "text")) for c in item["content"] if isinstance(c, dict)]
+        if isinstance(item.get("action"), dict):
+            item["action"] = _pick(item["action"], ("type", "query"))
+        if isinstance(item.get("changes"), dict):
+            item["changes"] = {path: _pick(c, ("type", "move_path")) for path, c in item["changes"].items()
+                               if isinstance(c, dict)}
+        out["payload"] = {"type": p["type"], "item": item}
+    else:
+        return None
+    return out
 
 
 # ---------------------------------------------------------------- redaction
@@ -262,6 +310,7 @@ def discover_projects(claude_dir, since=None):
                 sids.add(f.stem)
         top = [t for t in files if "subagents" not in t[0].parts] or files
         projects.append({
+            "agent": CLAUDE,
             "dir": d,
             "cwd": cwd,
             "name": project_name(cwd, d.name),
@@ -274,6 +323,100 @@ def discover_projects(claude_dir, since=None):
         })
     projects.sort(key=lambda p: p["last"], reverse=True)
     return projects, warnings
+
+
+def find_codex_dir(override=None):
+    """The Codex data folder (the one containing 'sessions'), or None when there is none."""
+    if override:
+        p = Path(override).expanduser()
+        if (p / "sessions").is_dir():
+            return p
+        raise UserError("--codex-dir %s has no 'sessions' folder inside it." % p)
+    c = Path(os.environ.get("CODEX_HOME") or (Path.home() / ".codex")).expanduser()
+    return c if (c / "sessions").is_dir() else None
+
+
+def discover_codex(codex_dir, since=None):
+    """Codex sessions grouped by the folder they ran in -> (sources, warnings)."""
+    by_cwd, warnings = {}, []
+    for f in sorted((codex_dir / "sessions").rglob("rollout-*.jsonl")):
+        try:
+            with open(str(f), "rb") as fh:
+                meta = json.loads(fh.readline())
+            st = f.stat()
+        except (OSError, ValueError):
+            continue
+        if since and datetime.datetime.fromtimestamp(st.st_mtime) < since:
+            continue
+        p = meta.get("payload") if isinstance(meta, dict) and meta.get("type") == "session_meta" else None
+        if not isinstance(p, dict) or not isinstance(p.get("cwd"), str) or not p["cwd"]:
+            continue
+        if p.get("thread_source") not in (None, "user"):
+            continue  # a subagent's thread
+        cwd = p["cwd"][4:] if p["cwd"].startswith("\\\\?\\") else p["cwd"]
+        s = by_cwd.setdefault(cwd, {
+            "agent": CODEX, "dir": codex_dir, "cwd": cwd, "name": project_name(cwd, cwd), "files": [],
+            "sessions": 0, "sids": [], "versions": set(), "last": 0, "size": 0})
+        s["files"].append(f)
+        s["sessions"] += 1
+        if isinstance(p.get("cli_version"), str):
+            s["versions"].add(p["cli_version"])
+        s["last"] = max(s["last"], st.st_mtime)
+        s["size"] += st.st_size
+    for s in by_cwd.values():
+        s["versions"] = sorted(s["versions"])
+    return list(by_cwd.values()), warnings
+
+
+def normal_cwd(cwd):
+    if not cwd:
+        return None
+    n = os.path.normpath(cwd)
+    return os.path.normcase(n) if os.name == "nt" or sys.platform == "darwin" else n
+
+
+def discover_all(claude_override=None, codex_override=None, since=None):
+    """-> (projects, warnings, claude_dir). A project is a folder with its sources: the same folder's Claude Code and
+    Codex sessions share one project (one code snapshot, one git history). Two sources of one tool never merge."""
+    sources, warnings = [], []
+    claude_dir = None
+    try:
+        claude_dir = find_claude_dir(claude_override)
+    except UserError as e:
+        if claude_override:
+            raise
+        claude_err = e
+    if claude_dir:
+        found, warns = discover_projects(claude_dir, since)
+        sources += found
+        warnings += warns
+    codex_dir = find_codex_dir(codex_override)
+    if codex_dir:
+        found, warns = discover_codex(codex_dir, since)
+        sources += found
+        warnings += warns
+    if not claude_dir and not codex_dir:
+        raise UserError("%s\nCodex: looked in %s (set CODEX_HOME, or pass --codex-dir <folder> containing 'sessions')."
+                        % (str(claude_err).replace("Claude Code data", "Claude Code or Codex data"),
+                           Path(os.environ.get("CODEX_HOME") or (Path.home() / ".codex")).expanduser()))
+    sources.sort(key=lambda s: s["last"], reverse=True)
+    projects = []
+    for s in sources:
+        key = normal_cwd(s["cwd"])
+        proj = next((p for p in projects if key and p["key"] == key and s["agent"] not in p["by_agent"]), None)
+        if not proj:
+            proj = {"key": key, "cwd": s["cwd"], "name": s["name"], "sources": [], "by_agent": {}}
+            projects.append(proj)
+        proj["sources"].append(s)
+        proj["by_agent"][s["agent"]] = s
+    for p in projects:
+        p["sessions"] = sum(s["sessions"] for s in p["sources"])
+        p["last"] = max(s["last"] for s in p["sources"])
+        p["size"] = sum(s["size"] for s in p["sources"])
+        agents = {s["agent"] for s in p["sources"]}
+        p["tool"] = TOOL_LABELS[p["sources"][0]["agent"]] if len(agents) == 1 else "Both"
+    projects.sort(key=lambda p: p["last"], reverse=True)
+    return projects, warnings, claude_dir
 
 
 def find_side_data(claude_dir, sids):
@@ -298,12 +441,12 @@ class KeyboardUnavailable(Exception):
     """Raw key input could not be set up; the caller falls back to the typed menu."""
 
 
-HEADER_ROW = "%3s  %-46s %8s  %-10s %9s" % ("#", "Project", "Sessions", "Last used", "Size")
+HEADER_ROW = "%3s  %-40s %-11s %8s  %-10s %9s" % ("#", "Project", "Tool", "Sessions", "Last used", "Size")
 
 
 def project_row(i, p):
-    return "%3d  %-46s %8d  %-10s %9s" % (
-        i, p["name"][:46], p["sessions"], datetime.date.fromtimestamp(p["last"]).isoformat(), human(p["size"]))
+    return "%3d  %-40s %-11s %8d  %-10s %9s" % (
+        i, p["name"][:40], p.get("tool", ""), p["sessions"], datetime.date.fromtimestamp(p["last"]).isoformat(), human(p["size"]))
 
 
 def arrows_available():
@@ -470,6 +613,7 @@ class Git:
 class Report:
     def __init__(self, alias):
         self.alias = alias
+        self.tools = []
         self.files = 0
         self.bytes = 0
         self.sessions = 0
@@ -535,6 +679,38 @@ class Stager:
             rep.skipped.append((label, "no permission to read (%s)" % (e.strerror or "denied")))
             return False
 
+    def stage_codex_file(self, src, root, rep):
+        """A Codex session: only the allowlisted fields of the allowlisted records (prune_codex), redacted."""
+        label = src.name
+        if src.is_symlink():
+            rep.skipped.append((label, "symlink"))
+            return
+        bad = 0
+        try:
+            st = src.stat()
+            dest = root / self.red.redact_path(label)
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            with open(str(src), "rb") as fin, open(str(dest), "w", encoding="utf-8", newline="\n") as fout:
+                for raw in fin:
+                    try:
+                        kept = prune_codex(json.loads(raw))
+                    except ValueError:
+                        bad += 1
+                        continue
+                    if kept:
+                        fout.write(json.dumps(self.red.redact_obj(kept), ensure_ascii=False) + "\n")
+        except PermissionError as e:
+            rep.skipped.append((label, "no permission to read (%s)" % (e.strerror or "denied")))
+            return
+        except FileNotFoundError:
+            return
+        if bad:
+            rep.notes.append("%d unreadable line(s) in %s were left out" % (bad, label))
+        mtime = max(st.st_mtime, MIN_ZIP_MTIME)
+        os.utime(str(dest), (mtime, mtime))
+        rep.files += 1
+        rep.bytes += dest.stat().st_size
+
     def _jsonl(self, src, dest, rep, label):
         bad = 0
         with open(str(src), "rb") as fin, open(str(dest), "w", encoding="utf-8", newline="\n") as fout:
@@ -555,30 +731,38 @@ class Stager:
         rep = Report(meta["alias"])
         base = stage / "projects" / meta["alias"]
         self.red.counts = Counter()
-        pdir = proj["dir"]
         cwd = Path(proj["cwd"]) if proj["cwd"] else None
+        agents = proj["by_agent"]
 
-        for f in proj["files"]:
-            self.stage_file(f, base / "transcripts", f.relative_to(pdir), rep)
+        if CLAUDE in agents:
+            src = agents[CLAUDE]
+            for f in src["files"]:
+                self.stage_file(f, base / "transcripts", f.relative_to(src["dir"]), rep)
+            found, missing = find_side_data(self.claude_dir, src["sids"])
+            for kind, path in found:
+                rels = [path] if path.is_file() else list(walk_files(path))
+                for f in rels:
+                    rel = f.relative_to(path.parent) if path.is_file() else Path(path.name) / f.relative_to(path)
+                    self.stage_file(f, base / "session-data" / kind, rel, rep)
+            if missing:
+                rep.notes.append("no %s found for these sessions" % ", ".join(missing))
+        if CODEX in agents:
+            for f in agents[CODEX]["files"]:
+                self.stage_codex_file(f, base / CODEX_TRANSCRIPTS, rep)
         rep.sessions = proj["sessions"]
-
-        found, missing = find_side_data(self.claude_dir, proj["sids"])
-        for kind, path in found:
-            rels = [path] if path.is_file() else list(walk_files(path))
-            for f in rels:
-                rel = f.relative_to(path.parent) if path.is_file() else Path(path.name) / f.relative_to(path)
-                self.stage_file(f, base / "session-data" / kind, rel, rep)
-        if missing:
-            rep.notes.append("no %s found for these sessions" % ", ".join(missing))
+        rep.tools = sorted(agents)
 
         if cwd and cwd.is_dir():
             self._code(cwd, base, rep)
             if not self.no_git:
                 self._git(cwd, base, rep)
-            for rel in ("CLAUDE.md", ".claude/CLAUDE.md"):
+            rels = ["CLAUDE.md", ".claude/CLAUDE.md"] if CLAUDE in agents else []
+            if CODEX in agents:
+                rels += ["AGENTS.md", ".codex/AGENTS.md", ".codex/config.toml"]
+            for rel in rels:
                 if (cwd / rel).is_file():
                     self.stage_file(cwd / rel, base / "instructions", Path(rel), rep)
-            for f in sorted((cwd / ".claude").glob("settings*.json")) if (cwd / ".claude").is_dir() else []:
+            for f in sorted((cwd / ".claude").glob("settings*.json")) if CLAUDE in agents and (cwd / ".claude").is_dir() else []:
                 self.stage_file(f, base / "instructions", Path(".claude") / f.name, rep)
         else:
             rep.notes.append("project folder no longer exists (%s): no code snapshot or git history"
@@ -699,11 +883,13 @@ manifest.json     what was collected, counts, redactions, skipped files
 labels.json       alias, outcome and reason per project
 projects/<alias>/
   transcripts/    Claude Code sessions (.jsonl), secrets and names redacted
+  transcripts-codex/  Codex sessions (.jsonl), cut down to the person's messages, the replies and the commands
+                  and files touched (no command output, file contents, diffs or reasoning); secrets and names redacted
   session-data/   file-history, todos, images for those sessions
   code/           final state of the project folder
   git-log.txt     redacted `git log -p`
   git.bundle      full git history; read it with: git clone git.bundle repo
-  instructions/   project CLAUDE.md and .claude/settings*.json
+  instructions/   project CLAUDE.md, .claude/settings*.json, AGENTS.md and .codex/ files
   extras/         files added by the person who ran the tool
 
 Redaction was applied to copies only; the originals were never modified.
@@ -719,11 +905,12 @@ def write_meta_files(stage, metas, reports, args, versions, redactor):
         "tool_version": VERSION,
         "os": platform.platform(),
         "python": platform.python_version(),
-        "claude_code_versions": sorted(versions),
+        "claude_code_versions": sorted(versions[CLAUDE]),
+        "codex_versions": sorted(versions[CODEX]),
         "created": datetime.datetime.now().isoformat(timespec="seconds"),
         "since": args.since.date().isoformat() if args.since else None,
         "projects": [{
-            "alias": r.alias, "sessions": r.sessions, "files": r.files, "bytes": r.bytes,
+            "alias": r.alias, "tools": r.tools, "sessions": r.sessions, "files": r.files, "bytes": r.bytes,
             "redactions": r.redactions, "git": r.git, "notes": r.notes,
             "skipped": [{"path": redactor.redact_path(p), "reason": why} for p, why in r.skipped],
         } for r in reports],
@@ -811,8 +998,9 @@ def parse_args(argv):
         except ValueError:
             raise argparse.ArgumentTypeError("expected YYYY-MM-DD, got '%s'" % s)
 
-    ap = argparse.ArgumentParser(description="Bundle Claude Code sessions into one redacted zip.")
+    ap = argparse.ArgumentParser(description="Bundle Claude Code and Codex sessions into one redacted zip.")
     ap.add_argument("--claude-dir", help="Claude data folder (the one containing 'projects')")
+    ap.add_argument("--codex-dir", help="Codex data folder (the one containing 'sessions'); default $CODEX_HOME or ~/.codex")
     ap.add_argument("--since", type=date, help="only sessions modified on/after this date (YYYY-MM-DD)")
     ap.add_argument("--dry-run", action="store_true", help="print the files that would be zipped, write nothing")
     ap.add_argument("--out", help="output folder, or a .zip file path (default: Desktop)")
@@ -824,13 +1012,12 @@ def run(args):
     print(BANNER)
     print("Version %s. No network access. Nothing is sent. Originals are never modified.\n" % VERSION)
 
-    claude_dir = find_claude_dir(args.claude_dir)
-    projects, warnings = discover_projects(claude_dir, args.since)
+    projects, warnings, claude_dir = discover_all(args.claude_dir, args.codex_dir, args.since)
     for w in warnings:
         print("Warning: %s" % w)
     if not projects:
-        raise UserError("No Claude Code sessions found in %s%s." % (
-            claude_dir / "projects", " since %s" % args.since.date() if args.since else ""))
+        raise UserError("No Claude Code or Codex sessions found%s." % (
+            " since %s" % args.since.date() if args.since else ""))
     selected = pick_projects(projects)
 
     names = []
@@ -862,7 +1049,8 @@ def run(args):
         print("\nCollecting and redacting (this can take a minute)...")
         stager = Stager(redactor, claude_dir, args.no_git)
         reports = [stager.stage_project(p, m, stage) for p, m in zip(selected, metas)]
-        versions = {v for p in selected for v in p["versions"]}
+        versions = {a: {v for p in selected for s in p["sources"] if s["agent"] == a for v in s["versions"]}
+                    for a in (CLAUDE, CODEX)}
         write_meta_files(stage, metas, reports, args, versions, redactor)
 
         if args.dry_run:

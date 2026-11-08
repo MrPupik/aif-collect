@@ -1,6 +1,6 @@
 # AI-fluent collect
 
-Bundles your Claude Code sessions into one zip
+Bundles your Claude Code and Codex sessions into one zip
 
 - **Local only.** Nothing is sent automaticlly. You send the zip yourself.
 - **Read only.** Your original files are never modified.
@@ -46,8 +46,9 @@ If you use step (2). Secrets become `[REDACTED]`, your home path and username be
 | `--no-git` | leave out git history |
 | `--out <folder or .zip>` | where to write the zip (default: Desktop) |
 | `--claude-dir <folder>` | your Claude data folder, if it isn't found automatically |
+| `--codex-dir <folder>` | your Codex data folder (the one containing `sessions`), if it isn't found automatically |
 
-If nothing is found, the tool prints the folders it checked. By default it looks in `$CLAUDE_CONFIG_DIR`, `~/.claude` and `~/.config/claude`.
+If nothing is found, the tool prints the folders it checked. By default it looks for Claude Code in `$CLAUDE_CONFIG_DIR`, `~/.claude` and `~/.config/claude`, and for Codex in `$CODEX_HOME` or `~/.codex`.
 
 ## Development
 
